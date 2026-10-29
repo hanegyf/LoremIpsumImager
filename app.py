@@ -15,11 +15,6 @@ st.write(
     "Encode files as Lorem Ipsum text, decode `.lorem` files, and verify that "
     "the original bytes survive a round trip. No local installation required."
 )
-st.info(
-    "Demo limit: source files for encoding and round-trip tests must be 20 KB or smaller. "
-    "Each byte expands into a line of words, so encoded files can become much larger than the original."
-)
-
 
 def words_from_upload(upload):
     if upload is None:
