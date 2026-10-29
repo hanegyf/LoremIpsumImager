@@ -6,7 +6,7 @@ import streamlit as st
 
 from main import LOREM_WORDS, decode, encode, pack, sha256, unpack
 
-MAX_SOURCE_BYTES = 20_000
+MAX_SOURCE_BYTES = 20_000_000
 MAX_LOREM_BYTES = 50 * 1024 * 1024
 
 st.set_page_config(page_title="LoremIpsumImager", page_icon=None, layout="wide")
