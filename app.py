@@ -3,10 +3,16 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from io import BytesIO
 import struct
+import os
+import shutil
+import struct
+import tempfile
 
-from main import LOREM_WORDS, decode, encode, pack, sha256, unpack
+from main import MAGIC, LOREM_WORDS, decode, encode, pack, sha256, unpack
 
 app = Flask(__name__)
+
+MAX_ENCODE_BYTES = 100 * 1024  # 100 KB
 
 PAGE = r'''<!doctype html>
 <html lang="en">
@@ -18,7 +24,7 @@ PAGE = r'''<!doctype html>
 *{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 header,main,footer{max-width:940px;margin:auto;padding-left:24px;padding-right:24px}header{padding-top:44px;padding-bottom:24px;border-bottom:1px solid var(--line)}h1{font-size:clamp(2rem,5vw,3rem);letter-spacing:-.045em;line-height:1.05;margin:0 0 12px;font-weight:720}header p{max-width:650px;color:var(--muted);margin:0}main{padding-top:28px;padding-bottom:44px}.intro{font-size:.92rem;color:var(--muted);margin:0 0 24px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.panel{background:var(--panel);border:1px solid var(--line);padding:22px;border-radius:8px;min-width:0}.panel.wide{grid-column:1/-1}h2{font-size:1.15rem;letter-spacing:-.02em;margin:0 0 5px} .desc{font-size:.9rem;color:var(--muted);margin:0 0 18px}label{display:block;font-weight:620;font-size:.88rem;margin:14px 0 6px}input[type=file]{display:block;width:100%;font:inherit;font-size:.85rem;padding:10px;border:1px solid var(--line);border-radius:5px;background:#fff}button{margin-top:18px;background:var(--ink);color:#fff;border:0;border-radius:5px;padding:10px 15px;font:inherit;font-weight:620;cursor:pointer}button:hover{background:var(--accent)}.result{padding:13px 15px;border-left:3px solid var(--accent);background:var(--soft);margin:20px 0;overflow-wrap:anywhere}.result.error{border-color:#a33}.result p{margin:4px 0}.hash{font-family:ui-monospace,SFMono-Regular,monospace;font-size:.82rem;overflow-wrap:anywhere}.muted{color:var(--muted)}footer{border-top:1px solid var(--line);padding-top:16px;padding-bottom:32px;color:var(--muted);font-size:.82rem}a{color:var(--accent)}@media(max-width:680px){.grid{grid-template-columns:1fr}.panel.wide{grid-column:auto}header{padding-top:30px}}
 </style></head><body>
-<header><h1>LoremIpsumImager</h1><p>Turn a file into Lorem Ipsum text, reconstruct it, and check whether the bytes survived unchanged.</p></header>
+<header><h1>LoremIpsumImager</h1><p>Turn a file into Lorem Ipsum text, or decode it.</p></header>
 <main><p class="intro">Choose a tool below. Encoded files can become much larger than the original.</p>
 {% if message %}<div class="result {% if error %}error{% endif %}"><strong>{{ message }}</strong>{% for line in details %}<p>{{ line }}</p>{% endfor %}</div>{% endif %}
 <div class="grid">
@@ -47,6 +53,37 @@ def safe_name(name, fallback="file.bin"):
     return Path(name or fallback).name or fallback
 
 
+def encode_file_streaming(source_path, output_path, words):
+    name = source_path.name.encode("utf-8")
+    size = source_path.stat().st_size
+
+    if len(name) > 255:
+        raise ValueError("Filename is too long.")
+
+    header = MAGIC + struct.pack(">BI", len(name), size) + name
+
+    with output_path.open("w", encoding="utf-8", newline="") as out:
+        first_line = True
+
+        def write_bytes(data):
+            nonlocal first_line
+            for value in data:
+                if not first_line:
+                    out.write("\n")
+                if value:
+                    out.write(" ".join(words[:value]))
+                first_line = False
+
+        write_bytes(header)
+
+        with source_path.open("rb") as source:
+            while True:
+                chunk = source.read(64 * 1024)
+                if not chunk:
+                    break
+                write_bytes(chunk)
+
+
 @app.get("/")
 def index():
     return page()
@@ -55,26 +92,51 @@ def index():
 @app.post("/encode")
 def encode_route():
     source = request.files.get("source")
+
     if not source or not source.filename:
         return page("Choose a file to encode.", error=True, status=400)
+
+    source.stream.seek(0, os.SEEK_END)
+    size = source.stream.tell()
+    source.stream.seek(0)
+
+    if size > MAX_ENCODE_BYTES:
+        return page(
+            "File is too large for the free demo",
+            [
+                f"Your file is {size:,} bytes. The limit is "
+                f"{MAX_ENCODE_BYTES:,} bytes (100 KB).",
+                "The encoding expands every byte into a line of text. "
+                "Use the command-line version for larger files."
+            ],
+            error=True,
+            status=413
+        )
+
+    directory = tempfile.mkdtemp(prefix="lorem-encode-")
+
     try:
         words = read_words(request.files.get("words"))
-        with TemporaryDirectory() as td:
-            source_path = Path(td) / safe_name(source.filename)
-            output_path = Path(td) / (source_path.stem + ".lorem")
-            source.save(source_path)
-            original_hash = sha256(source_path.read_bytes())
-            encode(pack(source_path), output_path, words)
-            output_size = output_path.stat().st_size
-            # send_file needs a live file, so return its bytes before the temp dir closes.
-            encoded = output_path.read_bytes()
-        response = send_file(BytesIO(encoded), as_attachment=True,
-                             download_name=Path(source.filename).stem + ".lorem",
-                             mimetype="text/plain; charset=utf-8")
-        response.headers["X-Original-SHA256"] = original_hash
-        response.headers["X-Encoded-Size"] = str(output_size)
+        source_path = Path(directory) / safe_name(source.filename)
+        output_path = Path(directory) / (source_path.stem + ".lorem")
+        source.save(source_path)
+
+        encode_file_streaming(source_path, output_path, words)
+
+        response = send_file(
+            output_path,
+            as_attachment=True,
+            download_name=output_path.name,
+            mimetype="text/plain; charset=utf-8"
+        )
+
+        response.call_on_close(
+            lambda: shutil.rmtree(directory, ignore_errors=True)
+        )
         return response
+
     except (OSError, ValueError, UnicodeError, struct.error) as exc:
+        shutil.rmtree(directory, ignore_errors=True)
         return page("Encoding failed", [str(exc)], error=True, status=400)
 
 
