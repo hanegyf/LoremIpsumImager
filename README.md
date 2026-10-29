@@ -3,8 +3,6 @@ LoremIpsumImager encodes a file as Lorem Ipsum text and reconstructs the origina
 
 The project also includes SHA-256 checks and comparison modes to make sure that a file survives the encode/decode process unchanged.
 
-Demo at: https://loremipsumimager.streamlit.app/
-
 ## How it works
 The encoder first packs the original iflename and file contents into a binary blob. It then represents each byte as one line containing that number of words:
 - A byte value of `0` becomes an empty line.

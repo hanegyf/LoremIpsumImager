@@ -1,200 +1,138 @@
+from flask import Flask, request, render_template_string, send_file
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from io import BytesIO
 import struct
-
-import streamlit as st
 
 from main import LOREM_WORDS, decode, encode, pack, sha256, unpack
 
-MAX_SOURCE_BYTES = 20_000_000
-MAX_LOREM_BYTES = 50 * 1024 * 1024
+app = Flask(__name__)
 
-st.set_page_config(page_title="LoremIpsumImager", page_icon=None, layout="wide")
-st.title("LoremIpsumImager")
-st.write(
-    "Encode files as Lorem Ipsum text, decode `.lorem` files, and verify that "
-    "the original bytes survive a round trip. No local installation required."
-)
+PAGE = r'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LoremIpsumImager</title>
+<style>
+:root{color-scheme:light;--ink:#24211f;--muted:#716b65;--line:#d9d3cc;--paper:#fbfaf7;--panel:#fff;--accent:#80563e;--soft:#f0ebe5}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+header,main,footer{max-width:940px;margin:auto;padding-left:24px;padding-right:24px}header{padding-top:44px;padding-bottom:24px;border-bottom:1px solid var(--line)}h1{font-size:clamp(2rem,5vw,3rem);letter-spacing:-.045em;line-height:1.05;margin:0 0 12px;font-weight:720}header p{max-width:650px;color:var(--muted);margin:0}main{padding-top:28px;padding-bottom:44px}.intro{font-size:.92rem;color:var(--muted);margin:0 0 24px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.panel{background:var(--panel);border:1px solid var(--line);padding:22px;border-radius:8px;min-width:0}.panel.wide{grid-column:1/-1}h2{font-size:1.15rem;letter-spacing:-.02em;margin:0 0 5px} .desc{font-size:.9rem;color:var(--muted);margin:0 0 18px}label{display:block;font-weight:620;font-size:.88rem;margin:14px 0 6px}input[type=file]{display:block;width:100%;font:inherit;font-size:.85rem;padding:10px;border:1px solid var(--line);border-radius:5px;background:#fff}button{margin-top:18px;background:var(--ink);color:#fff;border:0;border-radius:5px;padding:10px 15px;font:inherit;font-weight:620;cursor:pointer}button:hover{background:var(--accent)}.result{padding:13px 15px;border-left:3px solid var(--accent);background:var(--soft);margin:20px 0;overflow-wrap:anywhere}.result.error{border-color:#a33}.result p{margin:4px 0}.hash{font-family:ui-monospace,SFMono-Regular,monospace;font-size:.82rem;overflow-wrap:anywhere}.muted{color:var(--muted)}footer{border-top:1px solid var(--line);padding-top:16px;padding-bottom:32px;color:var(--muted);font-size:.82rem}a{color:var(--accent)}@media(max-width:680px){.grid{grid-template-columns:1fr}.panel.wide{grid-column:auto}header{padding-top:30px}}
+</style></head><body>
+<header><h1>LoremIpsumImager</h1><p>Turn a file into Lorem Ipsum text, reconstruct it, and check whether the bytes survived unchanged.</p></header>
+<main><p class="intro">Choose a tool below. Encoded files can become much larger than the original.</p>
+{% if message %}<div class="result {% if error %}error{% endif %}"><strong>{{ message }}</strong>{% for line in details %}<p>{{ line }}</p>{% endfor %}</div>{% endif %}
+<div class="grid">
+<section class="panel"><h2>Encode</h2><p class="desc">Create a .lorem text file from an uploaded file.</p><form action="/encode" method="post" enctype="multipart/form-data"><label for="source">File to encode</label><input id="source" type="file" name="source" required><label for="words">Custom word list (optional)</label><input id="words" type="file" name="words" accept=".txt,text/plain"><button type="submit">Encode file</button></form></section>
+<section class="panel"><h2>Decode</h2><p class="desc">Restore the original file from a .lorem file.</p><form action="/decode" method="post" enctype="multipart/form-data"><label for="lorem">.lorem file</label><input id="lorem" type="file" name="source" required><button type="submit">Decode file</button></form></section>
+<section class="panel wide"><h2>Compare / verify</h2><p class="desc">Compare two files byte-for-byte, or test one file through the full encode/decode process.</p><form action="/compare" method="post" enctype="multipart/form-data"><label for="first">First file (or file to test)</label><input id="first" type="file" name="first" required><label for="second">Second file (optional; leave blank for round-trip test)</label><input id="second" type="file" name="second"><label for="compare_words">Custom word list for round-trip test (optional)</label><input id="compare_words" type="file" name="words" accept=".txt,text/plain"><button type="submit">Compare / verify</button></form></section>
+</div></main><footer>Open-source project · <a href="https://github.com/hanegyf/LoremIpsumImager">Source on GitHub</a></footer></body></html>'''
 
-def words_from_upload(upload):
-    if upload is None:
+
+def read_words(upload):
+    if upload is None or not upload.filename:
         return LOREM_WORDS
-    try:
-        words = upload.getvalue().decode("utf-8").split()
-    except UnicodeDecodeError:
-        st.error("The word-list file must be valid UTF-8 text.")
-        return None
+    words = upload.read().decode("utf-8").split()
     if not words:
-        st.error("The word-list file must contain at least one word.")
-        return None
+        raise ValueError("The custom word list is empty.")
     while len(words) < 255:
         words.extend(words[:])
     return words
 
 
+def page(message=None, details=(), error=False, status=200):
+    return render_template_string(PAGE, message=message, details=details, error=error), status
+
+
 def safe_name(name, fallback="file.bin"):
-    name = Path(name or fallback).name
-    return name or fallback
+    return Path(name or fallback).name or fallback
 
 
-def show_lorem_preview(data):
-    lines = data.decode("utf-8").split("\n")
-    preview = []
-    for i, line in enumerate(lines[:6], start=1):
-        visible = line[:100]
-        if len(line) > 100:
-            visible += "..."
-        preview.append(f"{i:>3}: {visible}")
-    st.caption(f"Preview: first {min(6, len(lines))} lines of {len(lines):,} total lines.")
-    st.code("\n".join(preview) or "(empty file)", language="text")
+@app.get("/")
+def index():
+    return page()
 
 
-def check_source_size(upload):
-    if len(upload.getvalue()) > MAX_SOURCE_BYTES:
-        st.error(
-            f"This demo accepts source files up to {MAX_SOURCE_BYTES:,} bytes (20 KB). "
-            "The text representation expands substantially."
-        )
-        return False
-    return True
+@app.post("/encode")
+def encode_route():
+    source = request.files.get("source")
+    if not source or not source.filename:
+        return page("Choose a file to encode.", error=True, status=400)
+    try:
+        words = read_words(request.files.get("words"))
+        with TemporaryDirectory() as td:
+            source_path = Path(td) / safe_name(source.filename)
+            output_path = Path(td) / (source_path.stem + ".lorem")
+            source.save(source_path)
+            original_hash = sha256(source_path.read_bytes())
+            encode(pack(source_path), output_path, words)
+            output_size = output_path.stat().st_size
+            # send_file needs a live file, so return its bytes before the temp dir closes.
+            encoded = output_path.read_bytes()
+        response = send_file(BytesIO(encoded), as_attachment=True,
+                             download_name=Path(source.filename).stem + ".lorem",
+                             mimetype="text/plain; charset=utf-8")
+        response.headers["X-Original-SHA256"] = original_hash
+        response.headers["X-Encoded-Size"] = str(output_size)
+        return response
+    except (OSError, ValueError, UnicodeError, struct.error) as exc:
+        return page("Encoding failed", [str(exc)], error=True, status=400)
 
 
-encode_tab, decode_tab, compare_tab = st.tabs(["Encode", "Decode", "Compare / Verify"])
+@app.post("/decode")
+def decode_route():
+    source = request.files.get("source")
+    if not source or not source.filename:
+        return page("Choose a .lorem file to decode.", error=True, status=400)
+    try:
+        with TemporaryDirectory() as td:
+            path = Path(td) / safe_name(source.filename, "upload.lorem")
+            source.save(path)
+            name, data = unpack(decode(path))
+        return send_file(BytesIO(data), as_attachment=True, download_name=safe_name(name),
+                         mimetype="application/octet-stream")
+    except (OSError, ValueError, UnicodeError, struct.error) as exc:
+        return page("Decoding failed", [str(exc)], error=True, status=400)
 
-with encode_tab:
-    st.subheader("Encode a file")
-    st.write("Upload a small image or other file and download its `.lorem` representation.")
-    with st.form("encode_form"):
-        source_upload = st.file_uploader(
-            "File to encode", key="encode_source", help="For this hosted demo, use a file no larger than 20 KB."
-        )
-        word_upload = st.file_uploader(
-            "Custom word list (optional .txt)", type=["txt"], key="encode_words"
-        )
-        encode_clicked = st.form_submit_button("Encode")
 
-    if encode_clicked:
-        if source_upload is None:
-            st.error("Choose a file to encode.")
-        elif check_source_size(source_upload):
-            words = words_from_upload(word_upload)
-            if words is not None:
-                try:
-                    with TemporaryDirectory() as temp_dir:
-                        source_path = Path(temp_dir) / safe_name(source_upload.name)
-                        output_path = Path(temp_dir) / f"{source_path.stem}.lorem"
-                        source_path.write_bytes(source_upload.getvalue())
-                        encode(pack(source_path), output_path, words)
-                        lorem_data = output_path.read_bytes()
-                    st.success("Encoding complete.")
-                    st.write(f"Original size: {len(source_upload.getvalue()):,} bytes")
-                    st.write(f"Encoded size: {len(lorem_data):,} bytes")
-                    st.write(f"Original SHA-256: `{sha256(source_upload.getvalue())}`")
-                    st.download_button(
-                        "Download .lorem file",
-                        data=lorem_data,
-                        file_name=f"{Path(safe_name(source_upload.name)).stem}.lorem",
-                        mime="text/plain",
-                    )
-                    show_lorem_preview(lorem_data)
-                except (OSError, ValueError, UnicodeError, struct.error) as exc:
-                    st.error(f"Encoding failed: {exc}")
+@app.post("/compare")
+def compare_route():
+    first = request.files.get("first")
+    second = request.files.get("second")
+    if not first or not first.filename:
+        return page("Choose a file to compare or test.", error=True, status=400)
+    try:
+        first_data = first.read()
+        if second and second.filename:
+            second_data = second.read()
+            identical = first_data == second_data
+            return page("IDENTICAL" if identical else "DIFFERENT", [
+                f"{safe_name(first.filename)} — {len(first_data):,} bytes",
+                f"SHA-256: {sha256(first_data)}",
+                f"{safe_name(second.filename)} — {len(second_data):,} bytes",
+                f"SHA-256: {sha256(second_data)}",
+                "Files match byte-for-byte." if identical else "Files differ byte-for-byte."
+            ], error=not identical)
 
-with decode_tab:
-    st.subheader("Decode a .lorem file")
-    st.write("Upload a `.lorem` file to reconstruct and download the original file.")
-    lorem_upload = st.file_uploader(".lorem file", type=["lorem", "txt"], key="decode_source")
-    if lorem_upload is not None:
-        lorem_data = lorem_upload.getvalue()
-        if len(lorem_data) > MAX_LOREM_BYTES:
-            st.error("This demo accepts .lorem files up to 50 MB.")
-        elif st.button("Decode", key="decode_button"):
-            try:
-                with TemporaryDirectory() as temp_dir:
-                    lorem_path = Path(temp_dir) / safe_name(lorem_upload.name, "upload.lorem")
-                    lorem_path.write_bytes(lorem_data)
-                    original_name, original_data = unpack(decode(lorem_path))
-                download_name = safe_name(original_name)
-                st.success("Decoding complete.")
-                st.write(f"Recovered file: `{download_name}`")
-                st.write(f"Recovered size: {len(original_data):,} bytes")
-                st.write(f"Recovered SHA-256: `{sha256(original_data)}`")
-                st.download_button(
-                    "Download recovered file",
-                    data=original_data,
-                    file_name=download_name,
-                    mime="application/octet-stream",
-                )
-                suffix = Path(download_name).suffix.lower()
-                if suffix in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}:
-                    st.image(original_data, caption=f"Recovered preview: {download_name}")
-            except (OSError, ValueError, UnicodeError, struct.error) as exc:
-                st.error(f"Decoding failed: {exc}")
+        words = read_words(request.files.get("words"))
+        with TemporaryDirectory() as td:
+            source_path = Path(td) / safe_name(first.filename)
+            lorem_path = Path(td) / (source_path.stem + ".lorem")
+            source_path.write_bytes(first_data)
+            encode(pack(source_path), lorem_path, words)
+            encoded_size = lorem_path.stat().st_size
+            recovered_name, recovered = unpack(decode(lorem_path))
+        identical = first_data == recovered
+        return page("ROUND TRIP SUCCESSFUL" if identical else "ROUND TRIP FAILED", [
+            f"Original: {len(first_data):,} bytes",
+            f"Encoded text: {encoded_size:,} bytes",
+            f"Original SHA-256: {sha256(first_data)}",
+            f"Recovered SHA-256: {sha256(recovered)}",
+            f"Recovered filename: {safe_name(recovered_name)}",
+            "Recovered bytes match the original." if identical else "Recovered bytes differ from the original."
+        ], error=not identical)
+    except (OSError, ValueError, UnicodeError, struct.error) as exc:
+        return page("Comparison failed", [str(exc)], error=True, status=400)
 
-with compare_tab:
-    st.subheader("Compare files or verify a round trip")
-    compare_mode = st.radio(
-        "Choose a test", ["Compare two files", "Encode → decode → verify"], horizontal=True
-    )
 
-    if compare_mode == "Compare two files":
-        with st.form("compare_files_form"):
-            first_upload = st.file_uploader("First file", key="compare_first")
-            second_upload = st.file_uploader("Second file", key="compare_second")
-            compare_clicked = st.form_submit_button("Compare")
-        if compare_clicked:
-            if first_upload is None or second_upload is None:
-                st.error("Upload both files to compare them.")
-            else:
-                first_data = first_upload.getvalue()
-                second_data = second_upload.getvalue()
-                identical = first_data == second_data
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.write(f"**{first_upload.name}**")
-                    st.write(f"Size: {len(first_data):,} bytes")
-                    st.code(sha256(first_data))
-                with col2:
-                    st.write(f"**{second_upload.name}**")
-                    st.write(f"Size: {len(second_data):,} bytes")
-                    st.code(sha256(second_data))
-                if identical:
-                    st.success("IDENTICAL — the files have the same bytes.")
-                else:
-                    st.warning("DIFFERENT — the files have different bytes.")
-
-    else:
-        with st.form("roundtrip_form"):
-            roundtrip_upload = st.file_uploader("File to test", key="roundtrip_source")
-            roundtrip_words = st.file_uploader(
-                "Custom word list (optional .txt)", type=["txt"], key="roundtrip_words"
-            )
-            roundtrip_clicked = st.form_submit_button("Run round-trip test")
-        if roundtrip_clicked:
-            if roundtrip_upload is None:
-                st.error("Choose a file to test.")
-            elif check_source_size(roundtrip_upload):
-                words = words_from_upload(roundtrip_words)
-                if words is not None:
-                    original_data = roundtrip_upload.getvalue()
-                    try:
-                        with TemporaryDirectory() as temp_dir:
-                            source_path = Path(temp_dir) / safe_name(roundtrip_upload.name)
-                            lorem_path = Path(temp_dir) / f"{source_path.stem}.lorem"
-                            source_path.write_bytes(original_data)
-                            encode(pack(source_path), lorem_path, words)
-                            recovered_name, recovered_data = unpack(decode(lorem_path))
-                        original_hash = sha256(original_data)
-                        recovered_hash = sha256(recovered_data)
-                        st.write(f"Original SHA-256: `{original_hash}`")
-                        st.write(f"Recovered SHA-256: `{recovered_hash}`")
-                        st.write(f"Recovered filename: `{safe_name(recovered_name)}`")
-                        if original_data == recovered_data:
-                            st.success("SUCCESSFUL — the recovered file matches the original byte for byte.")
-                        else:
-                            st.error("FAILED — the recovered file differs from the original.")
-                    except (OSError, ValueError, UnicodeError, struct.error) as exc:
-                        st.error(f"Round-trip test failed: {exc}")
-
-st.divider()
-st.caption("Files are processed in temporary storage for the current session. They are not added to the project repository.")
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port= int(__import__("os").environ.get("PORT", "5000")))
