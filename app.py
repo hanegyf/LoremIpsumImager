@@ -1,4 +1,4 @@
-from flask import Flask, request, render_template_string, send_file
+from flask import Flask, request, render_template_string, send_file, redirect
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from io import BytesIO
@@ -12,7 +12,7 @@ from main import MAGIC, LOREM_WORDS, decode, encode, pack, sha256, unpack
 
 app = Flask(__name__)
 
-MAX_ENCODE_BYTES = 100 * 1024  # 100 KB
+MAX_ENCODE_BYTES = 1048576  # 1 MB
 
 PAGE = r'''<!doctype html>
 <html lang="en">
@@ -194,6 +194,12 @@ def compare_route():
         ], error=not identical)
     except (OSError, ValueError, UnicodeError, struct.error) as exc:
         return page("Comparison failed", [str(exc)], error=True, status=400)
+
+@app.get("/encode")
+@app.get("/decode")
+@app.get("/compare")
+def redirect_to_index():
+    return redirect("/")
 
 
 if __name__ == "__main__":
