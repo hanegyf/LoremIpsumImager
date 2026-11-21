@@ -1,4 +1,4 @@
-from flask import Flask, request, render_template_string, send_file
+from flask import Flask, request, render_template_string, send_file, redirect
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from io import BytesIO
@@ -12,7 +12,7 @@ from main import MAGIC, LOREM_WORDS, decode, encode, pack, sha256, unpack
 
 app = Flask(__name__)
 
-MAX_ENCODE_BYTES = 100 * 1024  # 100 KB
+MAX_ENCODE_BYTES = 1048576 # 1 MB
 
 PAGE = r'''<!doctype html>
 <html lang="en">
@@ -57,7 +57,7 @@ def encode_file_streaming(source_path, output_path, words):
     name = source_path.name.encode("utf-8")
     size = source_path.stat().st_size
 
-    if len(name) > 255:
+    if len(name) > 255: # shouldn't really ever be reached I hope
         raise ValueError("Filename is too long.")
 
     header = MAGIC + struct.pack(">BI", len(name), size) + name
@@ -105,9 +105,9 @@ def encode_route():
             "File is too large for the free demo",
             [
                 f"Your file is {size:,} bytes. The limit is "
-                f"{MAX_ENCODE_BYTES:,} bytes (100 KB).",
-                "The encoding expands every byte into a line of text. "
-                "Use the command-line version for larger files."
+                f"{MAX_ENCODE_BYTES:,} bytes.",
+                "Use the command-line version for larger files,",
+                "because this computer might crash if the file is too large."
             ],
             error=True,
             status=413
@@ -195,6 +195,11 @@ def compare_route():
     except (OSError, ValueError, UnicodeError, struct.error) as exc:
         return page("Comparison failed", [str(exc)], error=True, status=400)
 
+@app.get("/encode")
+@app.get("/decode")
+@app.get("/compare")
+def redirect_to_index():
+    return redirect("/")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port= int(__import__("os").environ.get("PORT", "5000")))
